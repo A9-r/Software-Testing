@@ -1,10 +1,13 @@
 """
-优化后的网页自动化测试工具
+优化后的网页自动化测试工具 - Pytest参数化版
 主要改进：
 1. 模块化设计 - 拆分成多个专职类
 2. 配置管理 - 集中管理常量和配置
 3. 减少重复代码 - 提取公共方法
 4. 改进错误处理 - 统一的异常处理机制
+5. Pytest参数化 - 使用@pytest.mark.parametrize装饰器，每个步骤独立执行
+6. 独立浏览器 - 使用@pytest.fixture(scope="function")，每个步骤独立浏览器
+7. 支持 'a' 命令 - 连续输入多个操作组成一个测试用例，输入'a'添加新测试用例
 """
 
 import time
@@ -536,8 +539,11 @@ class TestScriptGenerator:
         self.initial_url = initial_url
         self.test_step_count = 0
         self.test_steps_data = []  # 存储所有测试步骤数据
+        self.precondition_steps_data = []  # 存储前置步骤数据（所有需求共享）
         self.requirements = {}  # 按需求编号存储步骤 {requirement_id: [step_indices]}
         self.current_requirement = None  # 当前正在收集的需求编号
+        self.is_collecting_precondition = True  # 默认先收集前置步骤
+        self.precondition_completed = False  # 前置步骤是否已完成
         self._init_script_file()
     
     def _init_script_file(self):
@@ -547,7 +553,7 @@ class TestScriptGenerator:
             f.write(header)
     
     def _generate_script_header(self) -> str:
-        """生成脚本文件头部（使用比赛模板）"""
+        """生成脚本文件头部"""
         return f'''import os
 from datetime import datetime
 import pytest
@@ -560,38 +566,115 @@ from selenium.webdriver.support import expected_conditions as EC
 from time import sleep
 
 
-@pytest.fixture(scope="class")  # scope="class": 所有测试执行完才关闭浏览器(推荐，速度快); scope="function": 每个测试执行完就关闭
+@pytest.fixture(scope="class")
 def driver():
-    """
-    浏览器驱动器fixture
-    - scope="class": 整个测试类共用一个浏览器实例，所有测试执行完后关闭（推荐，执行速度快）
-    - scope="function": 每个测试函数使用独立的浏览器实例，每个测试执行完就关闭（慢但更独立）
-    """
-    service = Service(
-        # 提交最终代码脚本时，请将驱动路径换回官方路径"C:\\\\Users\\\\86153\\\\AppData\\\\Local\\\\Google\\\\Chrome\\\\Application\\\\chromedriver.exe"
-        executable_path="C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chromedriver.exe")
+    service = Service(executable_path="C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chromedriver.exe")
     driver = webdriver.Chrome(service=service)
     driver.get("{self.initial_url}")
     driver.maximize_window()
-    try:
-        yield driver
-    finally:
-        # 确保浏览器一定会被关闭（即使测试失败或中断）
+    yield driver
+    driver.quit()
+
+
+class BaseCtripFlight:
+    """基础类，包含所有测试类共用的操作方法"""
+
+    def execute_action(self, driver, by_type, locator, action_type, input_data=None, alternative_locators=None):
+        """统一的操作执行方法（支持备选定位器容错）"""
+        if action_type == 'click':
+            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators)
+            driver.execute_script("arguments[0].scrollIntoView({{block: 'center'}});", element)
+            sleep(0.5)
+            
+            windows_before = set(driver.window_handles)
+            
+            try:
+                element.click()
+            except:
+                driver.execute_script("arguments[0].click();", element)
+            
+            sleep(1)
+            
+            windows_after = set(driver.window_handles)
+            if len(windows_after) > len(windows_before):
+                new_window = list(windows_after - windows_before)[0]
+                driver.switch_to.window(new_window)
+            
+        elif action_type == 'input':
+            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators, timeout=20)
+            element.click()
+            sleep(0.3)
+            
+            try:
+                element.clear()
+                sleep(0.2)
+            except:
+                pass
+            
+            try:
+                driver.execute_script("""
+                    arguments[0].value = '';
+                    arguments[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    arguments[0].dispatchEvent(new Event('change', {{ bubbles: true }}));
+                """, element)
+                sleep(0.2)
+            except:
+                pass
+            
+            try:
+                element.send_keys(Keys.CONTROL + 'a')
+                sleep(0.1)
+                element.send_keys(Keys.BACKSPACE)
+                sleep(0.1)
+            except:
+                pass
+            
+            element.send_keys(input_data)
+            
+        elif action_type == 'hover':
+            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators)
+            driver.execute_script("arguments[0].scrollIntoView({{block: 'center'}});", element)
+            sleep(0.5)
+            actions = ActionChains(driver)
+            actions.move_to_element(element).perform()
+            sleep(1)
+            
+        elif action_type == 'window_switch':
+            window_index = int(locator.split('_')[1]) - 1
+            window_handles = driver.window_handles
+            driver.switch_to.window(window_handles[window_index])
+    
+    def _find_element_with_fallback(self, driver, by_type, locator, alternative_locators=None, timeout=10):
+        """使用主定位器查找元素，失败后尝试备选定位器"""
+        from selenium.common.exceptions import TimeoutException, NoSuchElementException
+        
         try:
-            driver.quit()
-            print("\\n浏览器已关闭")
-        except:
+            wait = WebDriverWait(driver, timeout)
+            element = wait.until(EC.presence_of_element_located((by_type, locator)))
+            return element
+        except TimeoutException:
             pass
+        
+        if alternative_locators:
+            for alt_by, alt_locator in alternative_locators:
+                try:
+                    wait = WebDriverWait(driver, 5)
+                    element = wait.until(EC.presence_of_element_located((alt_by, alt_locator)))
+                    return element
+                except TimeoutException:
+                    continue
+        
+        raise NoSuchElementException(f"无法找到元素: 主定位器和所有备选定位器均失败")
 
-
-class TestCtripFlight:
-   
-   
-   
-    # test-code-start
-
-
-    # 请在此处插入python+selenium代码
+    @staticmethod
+    def take_screenshot(driver, file_name):
+        timestamp = datetime.now().strftime("%H%M%S%d%f")
+        timestamped_file_name = f"{{timestamp}}_{{file_name}}"
+        screenshots_dir = "screenshots"
+        if not os.path.exists(screenshots_dir):
+            os.makedirs(screenshots_dir)
+        screenshot_file_path = os.path.join(screenshots_dir, timestamped_file_name)
+        driver.save_screenshot(screenshot_file_path)
 
 
 '''
@@ -610,27 +693,34 @@ class TestCtripFlight:
             print(f"⚠ 警告：需求编号格式不规范（应为R001、R002等）")
             return False
         
+        # 检查需求编号是否已存在
+        if requirement_id in self.requirements:
+            print(f"⚠ 警告：需求编号 {requirement_id} 已存在！")
+            print(f"   已有需求: {', '.join(sorted(self.requirements.keys()))}")
+            
+            # 询问用户是否继续使用该需求编号
+            while True:
+                choice = input(f"是否继续使用 {requirement_id}？(y-继续添加步骤/n-取消): ").strip().lower()
+                if choice == 'y':
+                    print(f"✓ 继续向需求 {requirement_id} 添加步骤")
+                    self.current_requirement = requirement_id
+                    return True
+                elif choice == 'n':
+                    print(f"✗ 已取消，请重新输入需求编号")
+                    return False
+                else:
+                    print("请输入 y 或 n")
+        
+        # 新需求编号
         self.current_requirement = requirement_id
-        if requirement_id not in self.requirements:
-            self.requirements[requirement_id] = []
-        print(f"✓ 当前需求编号已设置为: {requirement_id}")
+        self.requirements[requirement_id] = []
+        
+        print(f"✓ 当前需求编号已设置为: {requirement_id}（新需求）")
+        print(f"📝 现在请添加需求 {requirement_id} 的具体业务步骤")
         return True
     
     def add_test_method(self, element_data: Dict[str, str]) -> str:
         """添加测试步骤数据（收集数据而不是立即生成方法）"""
-        # 如果没有设置需求编号，询问用户
-        if self.current_requirement is None:
-            while True:
-                req_input = input("请输入需求编号 (格式：R001, R002等): ").strip()
-                if not req_input:
-                    print("需求编号不能为空")
-                    continue
-                if self.set_current_requirement(req_input):
-                    break
-        
-        self.test_step_count += 1
-        step_num = f"{self.test_step_count:03d}"  # 改为3位数
-        
         # 确定操作类型
         operation_type = element_data['operation_type']
         if operation_type == "输入":
@@ -643,35 +733,66 @@ class TestCtripFlight:
         # 提取By类型（如 By.CSS_SELECTOR -> CSS_SELECTOR）
         by_type_name = element_data['selector_type'].replace('By.', '')
         
-        # 生成测试用例编号：CtripFlight_R001_001
-        test_case_id = f"CtripFlight_{self.current_requirement}_{step_num}"
-        
-        # 构建测试步骤数据
-        step_data = {
-            'step_num': step_num,
-            'test_case_id': test_case_id,
-            'requirement_id': self.current_requirement,
-            'by_type': by_type_name,
-            'locator': element_data['selector'],
-            'alternative_locators': element_data.get('alternative_locators', []),
-            'action_type': action_type,
-            'test_name': element_data['search_text'],
-            'input_data': element_data.get('user_input', '')
-        }
-        
-        self.test_steps_data.append(step_data)
-        
-        # 将步骤索引添加到需求映射中
-        step_index = len(self.test_steps_data) - 1
-        self.requirements[self.current_requirement].append(step_index)
+        # 根据是否是前置步骤，添加到不同的列表
+        if self.is_collecting_precondition:
+            # 前置步骤（所有需求共享）
+            step_count = len(self.precondition_steps_data) + 1
+            step_num = f"P{step_count:03d}"  # P001, P002...
+            test_case_id = f"PreCondition_{step_num}"
+            
+            step_data = {
+                'step_num': step_num,
+                'test_case_id': test_case_id,
+                'by_type': by_type_name,
+                'locator': element_data['selector'],
+                'alternative_locators': element_data.get('alternative_locators', []),
+                'action_type': action_type,
+                'test_name': element_data['search_text'],
+                'input_data': element_data.get('user_input', '')
+            }
+            
+            self.precondition_steps_data.append(step_data)
+            step_type_text = "前置步骤"
+            req_text = "【共享】"
+        else:
+            # 业务步骤（需要需求编号）
+            if self.current_requirement is None:
+                print("\n⚠ 错误：请先输入 'b' 完成前置步骤并设置需求编号")
+                return "错误：未设置需求编号"
+            
+            # 确保需求编号在字典中存在（可能被删除后重新添加）
+            if self.current_requirement not in self.requirements:
+                self.requirements[self.current_requirement] = []
+            
+            self.test_step_count += 1
+            step_num = f"{self.test_step_count:03d}"  # 001, 002...
+            test_case_id = f"CtripFlight_{self.current_requirement}_{step_num}"
+            
+            step_data = {
+                'step_num': step_num,
+                'test_case_id': test_case_id,
+                'requirement_id': self.current_requirement,
+                'by_type': by_type_name,
+                'locator': element_data['selector'],
+                'alternative_locators': element_data.get('alternative_locators', []),
+                'action_type': action_type,
+                'test_name': element_data['search_text'],
+                'input_data': element_data.get('user_input', '')
+            }
+            
+            self.test_steps_data.append(step_data)
+            step_index = len(self.test_steps_data) - 1
+            self.requirements[self.current_requirement].append(step_index)
+            
+            step_type_text = "业务步骤"
+            req_text = f"【{self.current_requirement}】"
         
         # 显示收集的信息
         print(f"\n{'='*50}")
-        print(f"已收集测试步骤: {test_case_id}")
-        print(f"  需求编号: {self.current_requirement}")
+        print(f"已收集{step_type_text} {req_text}: {test_case_id}")
         print(f"  操作名称: {element_data['search_text']}")
         print(f"  定位方式: {element_data['selector_type']}")
-        print(f"  定位器: {element_data['selector']}")
+        print(f"  定位器: {element_data['selector'][:80]}{'...' if len(element_data['selector']) > 80 else ''}")
         print(f"  操作类型: {action_type}")
         if action_type == "input":
             print(f"  输入内容: {element_data['user_input']}")
@@ -696,6 +817,10 @@ class TestCtripFlight:
         
         # 生成测试用例编号
         test_case_id = f"CtripFlight_{self.current_requirement}_{step_num}"
+        
+        # 确保需求编号在字典中存在（可能被删除后重新添加）
+        if self.current_requirement not in self.requirements:
+            self.requirements[self.current_requirement] = []
         
         # 窗口切换作为特殊的click操作
         step_data = {
@@ -793,14 +918,12 @@ class TestCtripFlight:
     def _generate_test_data_for_requirement(self, req_id: str, step_indices: List[int]) -> str:
         """为单个需求生成测试数据（参数化，包含备选定位器）"""
         lines = []
-        lines.append(f"    # 需求 {req_id} 的测试数据")
         lines.append(f"    TEST_DATA_{req_id} = [")
         
         for idx in step_indices:
             step = self.test_steps_data[idx]
             test_case_id = step['test_case_id']
             by_type = step['by_type']
-            # 只转义双引号，因为我们用双引号包裹字符串，单引号不需要转义
             locator = step['locator'].replace('\\', '\\\\').replace('"', '\\"')
             action_type = step['action_type']
             test_name = step['test_name'].replace('\\', '\\\\').replace('"', '\\"')
@@ -811,7 +934,6 @@ class TestCtripFlight:
             alt_locators_list = []
             for alt_by, alt_loc in alternative_locators:
                 alt_by_name = alt_by.replace('By.', '')
-                # 只转义双引号和反斜杠
                 alt_loc_escaped = alt_loc.replace('\\', '\\\\').replace('"', '\\"')
                 alt_locators_list.append(f'(By.{alt_by_name}, "{alt_loc_escaped}")')
             
@@ -841,232 +963,126 @@ class TestCtripFlight:
         lines.append(f'        ids=[step[0] for step in TEST_DATA_{req_id}]')
         lines.append(f"    )")
         lines.append(f"    def {function_name}(self, driver, test_case_id, by_type, locator, alternative_locators, action_type, test_name, input_data):")
-        lines.append(f'        """测试需求 {req_id}"""')
-        lines.append("        # 调用统一的操作执行方法（支持备选定位器）")
+        
+        # 如果有前置步骤，只在第一个测试步骤时执行
+        if self.precondition_steps_data:
+            lines.append(f"        # 只在第一个测试步骤时执行前置步骤")
+            lines.append(f"        if not TestCtripFlight_{req_id}._precondition_executed:")
+            lines.append("            for precond_step in PreCondition.PRECONDITION_DATA:")
+            lines.append("                precond_id, precond_by, precond_loc, precond_alts, precond_action, precond_name, precond_input = precond_step")
+            lines.append("                self.execute_action(driver, precond_by, precond_loc, precond_action, precond_input, precond_alts)")
+            lines.append("                sleep(0.5)")
+            lines.append(f"            TestCtripFlight_{req_id}._precondition_executed = True")
+            lines.append("")
+            lines.append("        # 执行业务步骤")
+        
         lines.append("        self.execute_action(driver, by_type, locator, action_type, input_data, alternative_locators)")
-        lines.append("        # 截图")
         lines.append("        self.take_screenshot(driver, f\"{test_case_id}.png\")")
         lines.append("        sleep(1)")
         
         return '\n'.join(lines)
     
+    def _generate_precondition_class(self) -> str:
+        """生成共享的前置步骤类（仅包含数据，不包含测试方法）"""
+        if not self.precondition_steps_data:
+            return ""
+        
+        lines = []
+        lines.append("class PreCondition:")
+        lines.append("    \"\"\"所有需求共享的前置步骤数据\"\"\"")
+        lines.append("    PRECONDITION_DATA = [")
+        
+        for step in self.precondition_steps_data:
+            test_case_id = step['test_case_id']
+            by_type = step['by_type']
+            locator = step['locator'].replace('\\', '\\\\').replace('"', '\\"')
+            action_type = step['action_type']
+            test_name = step['test_name'].replace('\\', '\\\\').replace('"', '\\"')
+            input_data = step.get('input_data', '')
+            
+            alternative_locators = step.get('alternative_locators', [])
+            alt_locators_list = []
+            for alt_by, alt_loc in alternative_locators:
+                alt_by_name = alt_by.replace('By.', '')
+                alt_loc_escaped = alt_loc.replace('\\', '\\\\').replace('"', '\\"')
+                alt_locators_list.append(f'(By.{alt_by_name}, "{alt_loc_escaped}")')
+            
+            alt_locators_str = '[' + ', '.join(alt_locators_list) + ']' if alt_locators_list else '[]'
+            
+            if input_data:
+                input_data = input_data.replace('\\', '\\\\').replace('"', '\\"')
+                input_str = f'"{input_data}"'
+            else:
+                input_str = 'None'
+            
+            line = f'        ("{test_case_id}", By.{by_type}, "{locator}", {alt_locators_str}, "{action_type}", "{test_name}", {input_str}),'
+            lines.append(line)
+        
+        lines.append("    ]")
+        
+        return '\n'.join(lines)
+    
     def complete_script(self):
-        """完成脚本，按需求生成参数化测试函数"""
-        if not self.test_steps_data:
+        """完成脚本，生成共享前置步骤类和各个需求类"""
+        if not self.test_steps_data and not self.precondition_steps_data:
             print("⚠ 警告：没有收集到任何测试步骤")
             return
         
-        # 生成所有需求的测试数据
-        test_data_sections = []
+        all_classes = []
+        
+        # 1. 生成共享的前置步骤类（只生成一次）
+        precondition_class = self._generate_precondition_class()
+        if precondition_class:
+            all_classes.append(precondition_class)
+        
+        # 2. 生成所有需求的业务步骤类
         for req_id in sorted(self.requirements.keys()):
-            step_indices = self.requirements[req_id]
-            data_code = self._generate_test_data_for_requirement(req_id, step_indices)
-            test_data_sections.append(data_code)
-        
-        all_test_data = '\n\n'.join(test_data_sections)
-        
-        # 生成所有需求的测试函数
-        test_functions = []
-        for req_id in sorted(self.requirements.keys()):
-            step_indices = self.requirements[req_id]
-            func_code = self._generate_test_function_for_requirement(req_id, step_indices)
-            test_functions.append(func_code)
-        
-        all_functions = '\n\n'.join(test_functions)
-        
-        # 生成脚本尾部（包含辅助方法）
-        script_footer = '''
+            if req_id in self.requirements and self.requirements[req_id]:
+                step_indices = self.requirements[req_id]
+                data_code = self._generate_test_data_for_requirement(req_id, step_indices)
+                func_code = self._generate_test_function_for_requirement(req_id, step_indices)
+                
+                # 添加类变量（用于标记前置步骤是否已执行）
+                class_var = "    _precondition_executed = False\n    " if self.precondition_steps_data else "    "
+                
+                class_code = f'''class TestCtripFlight_{req_id}(BaseCtripFlight):
+{class_var}
+{data_code}
 
-    # test-code-end
-
-    def execute_action(self, driver, by_type, locator, action_type, input_data=None, alternative_locators=None):
-        """
-        统一的操作执行方法（支持备选定位器容错）
-        
-        Args:
-            driver: WebDriver实例
-            by_type: 主定位方式（By.CSS_SELECTOR等）
-            locator: 主定位器表达式
-            action_type: 操作类型（click/input/hover/window_switch）
-            input_data: 输入数据（可选）
-            alternative_locators: 备选定位器列表 [(By.XX, "locator"), ...]
-        """
-        # 打印正在使用的定位器信息
-        print(f"\\n[定位器] 主定位: {by_type} = {locator[:100]}{'...' if len(locator) > 100 else ''}")
-        if alternative_locators:
-            print(f"[定位器] 备选定位器数量: {len(alternative_locators)}")
-        
-        if action_type == 'click':
-            # 点击操作（支持备选定位器）
-            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators)
-            
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-            sleep(0.5)
-            
-            # 记录点击前的窗口
-            windows_before = set(driver.window_handles)
-            
-            try:
-                element.click()
-            except:
-                driver.execute_script("arguments[0].click();", element)
-            
-            sleep(1)
-            
-            # 检查是否有新窗口
-            windows_after = set(driver.window_handles)
-            if len(windows_after) > len(windows_before):
-                new_window = list(windows_after - windows_before)[0]
-                driver.switch_to.window(new_window)
-            
-        elif action_type == 'input':
-            # 输入操作（支持备选定位器）
-            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators, timeout=20)
-            element.click()
-            sleep(0.5)
-            
-            # 强力清空输入框（针对携程等自定义控件）
-            # 方法1: 三次Ctrl+A删除（最可靠的物理操作）
-            for _ in range(3):
-                try:
-                    element.send_keys(Keys.CONTROL + 'a')
-                    sleep(0.1)
-                    element.send_keys(Keys.BACKSPACE)
-                    sleep(0.1)
-                except:
-                    pass
-            
-            # 方法2: JavaScript强制清空并触发事件
-            try:
-                driver.execute_script("""
-                    arguments[0].value = '';
-                    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
-                    arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
-                """, element)
-                sleep(0.2)
-            except:
-                pass
-            
-            # 方法3: 再次尝试标准clear()
-            try:
-                element.clear()
-                sleep(0.2)
-            except:
-                pass
-            
-            # 最后一次确认清空：再次全选删除
-            try:
-                element.send_keys(Keys.CONTROL + 'a')
-                element.send_keys(Keys.DELETE)
-                sleep(0.2)
-            except:
-                pass
-            
-            element.send_keys(input_data)
-            
-        elif action_type == 'hover':
-            # 鼠标悬浮操作（支持备选定位器）
-            element = self._find_element_with_fallback(driver, by_type, locator, alternative_locators)
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-            sleep(0.5)
-            actions = ActionChains(driver)
-            actions.move_to_element(element).perform()
-            sleep(1)
-            
-        elif action_type == 'window_switch':
-            # 窗口切换操作
-            window_index = int(locator.split('_')[1]) - 1
-            window_handles = driver.window_handles
-            driver.switch_to.window(window_handles[window_index])
-    
-    def _find_element_with_fallback(self, driver, by_type, locator, alternative_locators=None, timeout=10):
-        """
-        使用主定位器查找元素，失败后尝试备选定位器
-        
-        Args:
-            driver: WebDriver实例
-            by_type: 主定位方式
-            locator: 主定位器
-            alternative_locators: 备选定位器列表
-            timeout: 超时时间
-            
-        Returns:
-            找到的WebElement
-            
-        Raises:
-            NoSuchElementException: 所有定位器都失败时抛出
-        """
-        from selenium.common.exceptions import TimeoutException, NoSuchElementException
-        
-        # 尝试主定位器
-        try:
-            wait = WebDriverWait(driver, timeout)
-            element = wait.until(EC.presence_of_element_located((by_type, locator)))
-            print(f"[定位成功] 使用主定位器")
-            return element
-        except TimeoutException:
-            print(f"[定位失败] 主定位器失败: {by_type}")
-        
-        # 尝试备选定位器
-        if alternative_locators:
-            print(f"[定位尝试] 开始尝试 {len(alternative_locators)} 个备选定位器...")
-            for i, (alt_by, alt_locator) in enumerate(alternative_locators, 1):
-                try:
-                    print(f"  [{i}/{len(alternative_locators)}] 尝试: {alt_by} = {alt_locator[:80]}{'...' if len(alt_locator) > 80 else ''}")
-                    wait = WebDriverWait(driver, 5)
-                    element = wait.until(EC.presence_of_element_located((alt_by, alt_locator)))
-                    print(f"  ✓ 备选定位器 [{i}] 成功！")
-                    return element
-                except TimeoutException:
-                    print(f"  ✗ 备选定位器 [{i}] 失败")
-                    continue
-        
-        # 所有定位器都失败
-        raise NoSuchElementException(f"无法找到元素: 主定位器和所有备选定位器均失败")
-
-    @staticmethod
-    def take_screenshot(driver, file_name):
-        timestamp = datetime.now().strftime("%H%M%S%d%f")
-        timestamped_file_name = f"{timestamp}_{file_name}"
-        screenshots_dir = "screenshots"
-        if not os.path.exists(screenshots_dir):
-            os.makedirs(screenshots_dir)
-        screenshot_file_path = os.path.join(screenshots_dir, timestamped_file_name)
-        driver.save_screenshot(screenshot_file_path)
-
-
-if __name__ == "__main__":
-    # 执行测试，即使测试失败也会继续执行并正确关闭浏览器
-    pytest.main(["-v", "-s", __file__, "--tb=short"])
+{func_code}
 '''
+                all_classes.append(class_code)
+        
+        all_classes_str = '\n\n'.join(all_classes)
         
         # 追加到文件
         with open(self.script_file, 'a', encoding='utf-8') as f:
-            f.write(all_test_data)
-            f.write('\n\n')
-            f.write(all_functions)
-            f.write(script_footer)
+            f.write(all_classes_str)
         
         # 打印总结
         print(f"\n{'='*80}")
-        print(f"✓ 测试脚本生成完成（Pytest参数化 + 比赛规范）: {self.script_file}")
+        print(f"✓ 测试脚本生成完成: {self.script_file}")
         print(f"{'='*80}")
-        print(f"  总步骤数: {self.test_step_count}")
+        print(f"  前置步骤总数: {len(self.precondition_steps_data)}")
+        print(f"  业务步骤总数: {len(self.test_steps_data)}")
         print(f"  需求数量: {len(self.requirements)}")
-        print(f"  生成内容:")
+        print(f"\n生成内容:")
+        if self.precondition_steps_data:
+            print(f"    ✓ PreCondition - {len(self.precondition_steps_data)} 个前置步骤（所有需求共享）")
         for req_id in sorted(self.requirements.keys()):
-            step_count = len(self.requirements[req_id])
-            print(f"    ✓ TEST_DATA_{req_id} - {step_count} 个测试数据")
-            print(f"    ✓ test_CtripFlight_{req_id}() - 参数化测试函数")
-        print(f"\n优势特性:")
-        print(f"  ✅ 使用Pytest参数化 - 每个步骤独立执行和报告")
-        print(f"  ✅ 符合比赛规范 - 每个需求对应一个测试函数")
-        print(f"  ✅ 测试用例ID - {', '.join([s['test_case_id'] for s in self.test_steps_data[:3]])}...")
+            step_count = len(self.requirements.get(req_id, []))
+            if step_count > 0:
+                print(f"    ✓ TestCtripFlight_{req_id} - {step_count} 个业务步骤")
+        print(f"\n运行流程:")
+        if self.precondition_steps_data:
+            print(f"  每个需求类的第一个测试步骤前会执行 PreCondition 中的前置步骤")
+            print(f"  同一需求类的后续测试步骤不会重复执行前置步骤")
         print(f"\n运行测试命令:")
         print(f"  pytest {self.script_file} -v")
         print(f"  pytest {self.script_file} -v -s  (显示详细输出)")
-        print(f"  pytest {self.script_file}::TestCtripFlight::test_CtripFlight_R001 -v  (运行单个需求)")
         print(f"{'='*80}")
+
+
 
 
 # ============ 窗口管理器类 ============
@@ -1099,7 +1115,6 @@ class WindowManager:
                 new_window = list(new_windows - previous_windows)[0]
                 self.driver.switch_to.window(new_window)
                 self.current_window = new_window
-                print(f"已切换到新窗口: {self.driver.title}")
                 return True
             return False
         except Exception as e:
@@ -1483,20 +1498,17 @@ class WebAutomationTool:
             
             user_input = input("请输入内容: ").strip()
             
-            # 强力清空输入框（针对携程等自定义控件）
+            # 清空输入框（标准方法优先 - 速度快，适合大多数网站）
             from selenium.webdriver.common.keys import Keys
             
-            # 方法1: 三次Ctrl+A删除（最可靠的物理操作）
-            for _ in range(3):
-                try:
-                    element.send_keys(Keys.CONTROL + 'a')
-                    time.sleep(0.1)
-                    element.send_keys(Keys.BACKSPACE)
-                    time.sleep(0.1)
-                except:
-                    pass
+            # 方法1: 标准clear()方法（快速高效）
+            try:
+                element.clear()
+                time.sleep(0.2)
+            except:
+                pass
             
-            # 方法2: JavaScript强制清空并触发事件
+            # 方法2: JavaScript清空并触发事件（处理特殊情况）
             try:
                 self.driver.execute_script("""
                     arguments[0].value = '';
@@ -1507,18 +1519,12 @@ class WebAutomationTool:
             except:
                 pass
             
-            # 方法3: 再次尝试标准clear()
-            try:
-                element.clear()
-                time.sleep(0.2)
-            except:
-                pass
-            
-            # 最后一次确认清空：再次全选删除
+            # 方法3: 物理按键清空（最后手段，适用于自定义控件）
             try:
                 element.send_keys(Keys.CONTROL + 'a')
-                element.send_keys(Keys.DELETE)
-                time.sleep(0.2)
+                time.sleep(0.1)
+                element.send_keys(Keys.BACKSPACE)
+                time.sleep(0.1)
             except:
                 pass
             
@@ -1819,17 +1825,32 @@ class WebAutomationTool:
             if not text.strip():
                 continue
             
-            print(f"\n[{i}/{len(texts)}] 正在处理: '{text}'")
-            
-            success = self.find_and_click_element(text, auto_mode=True)
-            
-            if not success:
+            # 支持重试机制
+            retry_count = 1
+            while True:
+                print(f"\n[{i}/{len(texts)}] 正在处理: '{text}'" + (f" (第{retry_count}次尝试)" if retry_count > 1 else ""))
+                
+                success = self.find_and_click_element(text, auto_mode=True)
+                
+                if success:
+                    break  # 成功则跳出重试循环
+                
+                # 失败时询问用户
                 print(f"处理 '{text}' 失败")
                 choice = input("请选择操作 (1-重试, 2-跳过, 3-停止): ").strip()
+                
                 if choice == '3':
                     print("停止自动化流程")
-                    break
+                    return  # 直接返回，结束整个流程
                 elif choice == '2':
+                    print(f"跳过 '{text}'")
+                    break  # 跳出重试循环，继续下一个元素
+                elif choice == '1':
+                    retry_count += 1
+                    continue  # 继续重试循环
+                else:
+                    print("无效选择，默认重试")
+                    retry_count += 1
                     continue
             
             time.sleep(1)
@@ -1839,7 +1860,7 @@ class WebAutomationTool:
     def interactive_workflow(self):
         """交互式工作流"""
         print("=" * 80)
-        print("Web自动化测试工具 - 比赛版（含参数化优化）")
+        print("Web自动化测试工具 - 前置步骤+业务步骤模式")
         print("=" * 80)
         print("功能说明:")
         print("- 输入元素文本进行查找和点击")
@@ -1847,30 +1868,31 @@ class WebAutomationTool:
         print("- 输入'悬浮'执行鼠标悬浮操作")
         print("- 输入'添加'手动添加CSS选择器（只点击）")
         print("- 输入'窗口'切换浏览器窗口")
-        print("- 输入'req'或'需求'切换当前需求编号（如R001、R002）")
+        print("- 输入'b'完成前置步骤，开始添加具体业务步骤")
+        print("- 输入'a'添加新测试用例（完成当前测试用例，开始新的测试用例）")
         print("- 输入'l'显示所有已添加的操作")
         print("- 输入'r'删除某个已添加的操作")
         print("- 使用分号(；)分隔多个元素启动自动化模式")
-        print("- 输入'quit'退出程序")
+        print("- 输入'quit'退出程序并生成参数化测试脚本")
         print("=" * 80)
         
-        # 初始设置需求编号
+        # 初始提示收集前置步骤
         if self.script_generator:
-            print("\n请设置初始需求编号:")
-            while True:
-                req_input = input("请输入需求编号 (格式：R001, R002等): ").strip()
-                if not req_input:
-                    print("需求编号不能为空")
-                    continue
-                if self.script_generator.set_current_requirement(req_input):
-                    break
+            print("\n" + "="*80)
+            print("📝 第一步：请先添加所有需求共享的前置步骤（共同的操作）")
+            print("   例如：悬浮菜单、点击机票、选择单程等")
+            print("   完成后输入 'b' 开始添加具体需求")
+            print("="*80)
         
         while True:
             try:
-                # 显示窗口和当前需求信息
+                # 显示窗口和当前状态信息
                 self.window_manager.print_window_info()
-                if self.script_generator and self.script_generator.current_requirement:
-                    print(f"【当前需求: {self.script_generator.current_requirement}】", end=" ")
+                if self.script_generator:
+                    if self.script_generator.is_collecting_precondition:
+                        print(f"【前置步骤收集中】", end=" ")
+                    elif self.script_generator.current_requirement:
+                        print(f"【当前需求: {self.script_generator.current_requirement}】", end=" ")
                 user_input = input("请输入操作 (或命令): ").strip()
                 
                 # 退出命令
@@ -1878,25 +1900,145 @@ class WebAutomationTool:
                     print("程序结束")
                     break
                 
-                # 切换需求编号
-                if user_input.lower() in ['req', '需求', 'requirement']:
+                # 'b' 命令：完成前置步骤，开始业务步骤
+                if user_input.lower() == 'b':
                     if not self.script_generator:
                         print("脚本生成器未初始化")
                         continue
                     
-                    print(f"\n当前需求编号: {self.script_generator.current_requirement}")
-                    print(f"已有需求: {', '.join(sorted(self.script_generator.requirements.keys())) if self.script_generator.requirements else '无'}")
+                    if not self.script_generator.is_collecting_precondition:
+                        print("⚠ 当前已经在业务步骤收集模式")
+                        continue
                     
+                    precond_count = len(self.script_generator.precondition_steps_data)
+                    
+                    print(f"\n{'='*80}")
+                    print(f"✓ 前置步骤收集完成: 共 {precond_count} 个步骤")
+                    print(f"{'='*80}")
+                    
+                    # 切换到业务步骤收集模式
+                    self.script_generator.is_collecting_precondition = False
+                    self.script_generator.precondition_completed = True
+                    
+                    # 立即要求输入第一个需求编号
+                    print(f"\n📝 请输入第一个需求编号:")
                     while True:
-                        req_input = input("\n请输入新的需求编号 (格式：R001, R002等, 或输入'c'取消): ").strip()
+                        req_input = input("请输入需求编号 (格式：R001, R002等): ").strip()
+                        if not req_input:
+                            print("需求编号不能为空")
+                            continue
+                        if self.script_generator.set_current_requirement(req_input):
+                            print(f"\n✓ 现在可以开始添加需求 {req_input} 的具体业务步骤")
+                            break
+                    continue
+                
+                # 添加新测试用例命令
+                if user_input.lower() == 'a':
+                    if not self.script_generator:
+                        print("脚本生成器未初始化")
+                        continue
+                    
+                    current_req = self.script_generator.current_requirement
+                    current_steps = len(self.script_generator.requirements.get(current_req, []))
+                    
+                    print(f"\n{'='*80}")
+                    print(f"✓ 测试用例 {current_req} 已完成，共收集 {current_steps} 个步骤")
+                    print(f"{'='*80}")
+                    
+                    # 关闭当前浏览器
+                    print("\n🔴 关闭当前浏览器...")
+                    try:
+                        self.driver.quit()
+                    except:
+                        pass
+                    
+                    # 重新打开新浏览器
+                    print("🚀 启动新浏览器...")
+                    try:
+                        self._init_browser()
+                        initial_url = self.script_generator.initial_url
+                        self.driver.get(initial_url)
+                        self.driver.maximize_window()
+                        print(f"✓ 已打开: {initial_url}")
+                    except Exception as e:
+                        print(f"⚠ 重新打开浏览器失败: {e}")
+                        print("程序将退出")
+                        break
+                    
+                    existing_reqs = sorted(self.script_generator.requirements.keys())
+                    if existing_reqs:
+                        print(f"\n已有测试用例: {', '.join(existing_reqs)}")
+                    print("\n请输入新测试用例的需求编号:")
+                    print("💡 提示：请使用不同的需求编号，避免重复")
+                    
+                    new_req_id = None
+                    while True:
+                        req_input = input("请输入需求编号 (格式：R001, R002等, 或输入'c'取消): ").strip()
                         if req_input.lower() == 'c':
-                            print("已取消切换需求编号")
+                            print("已取消添加新测试用例")
                             break
                         if not req_input:
                             print("需求编号不能为空")
                             continue
                         if self.script_generator.set_current_requirement(req_input):
+                            new_req_id = req_input
+                            print(f"\n✓ 开始收集测试用例 {req_input} 的操作步骤")
                             break
+                    
+                    if new_req_id is None:
+                        continue
+                    
+                    # 执行共享的前置步骤（如果有的话）
+                    if self.script_generator.precondition_steps_data:
+                        print(f"\n🔄 正在执行前置步骤...")
+                        for step in self.script_generator.precondition_steps_data:
+                            print(f"  执行: {step['test_name']}")
+                            
+                            # 根据操作类型执行相应操作
+                            from selenium.webdriver.common.by import By as ByClass
+                            from selenium.webdriver.support.ui import WebDriverWait
+                            from selenium.webdriver.support import expected_conditions as EC
+                            
+                            element = None
+                            try:
+                                # 尝试使用主定位器，带等待
+                                by_type = getattr(ByClass, step['by_type'])
+                                wait = WebDriverWait(self.driver, 10)
+                                element = wait.until(EC.presence_of_element_located((by_type, step['locator'])))
+                            except Exception as e1:
+                                # 尝试备选定位器
+                                alternative_locators = step.get('alternative_locators', [])
+                                if alternative_locators:
+                                    for alt_by, alt_locator in alternative_locators:
+                                        try:
+                                            alt_by_type = getattr(ByClass, alt_by.replace('By.', ''))
+                                            wait = WebDriverWait(self.driver, 5)
+                                            element = wait.until(EC.presence_of_element_located((alt_by_type, alt_locator)))
+                                            break
+                                        except:
+                                            continue
+                            
+                            if element:
+                                try:
+                                    if step['action_type'] == 'click':
+                                        self.element_operator.click_element_safely(element)
+                                    elif step['action_type'] == 'input':
+                                        element.clear()
+                                        time.sleep(0.2)
+                                        element.send_keys(step['input_data'])
+                                    elif step['action_type'] == 'hover':
+                                        self.element_operator.hover_element_safely(element)
+                                    
+                                    # 等待操作完成
+                                    time.sleep(1)
+                                except Exception as e:
+                                    print(f"  ⚠ 执行操作失败: {e}")
+                            else:
+                                print(f"  ⚠ 未找到元素: {step['test_name']}")
+                        
+                        print(f"✓ 前置步骤执行完成")
+                        time.sleep(1)  # 额外等待，确保页面稳定
+                    
                     continue
                 
                 # 显示所有已添加的操作
